@@ -109,9 +109,49 @@ class MainWindow(QMainWindow):
         self._worker: ScanWorker | None = None
 
         self._build_ui(color_mode)
+        self._apply_dwm_theme()
 
         if start_path:
             self._start_scan(start_path)
+
+    # ── Windows title bar theming ─────────────────────────────────────────────
+
+    def _apply_dwm_theme(self) -> None:
+        """Paint the native title bar in VOID black using Windows DWM APIs."""
+        try:
+            import ctypes
+            dwm = ctypes.windll.dwmapi
+            hwnd = int(self.winId())  # forces native window creation
+
+            # Dark mode — themes the min/max/close buttons (Win 10 1809+)
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            dark = ctypes.c_int(1)
+            dwm.DwmSetWindowAttribute(
+                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                ctypes.byref(dark), ctypes.sizeof(dark),
+            )
+
+            # Caption background: VOID #060612 → COLORREF 0x00120606 (BGR)
+            DWMWA_CAPTION_COLOR = 35
+            caption = ctypes.c_uint32(0x00120606)
+            dwm.DwmSetWindowAttribute(
+                hwnd, DWMWA_CAPTION_COLOR,
+                ctypes.byref(caption), ctypes.sizeof(caption),
+            )
+
+            # Caption text: TEXT #e8e8ff → COLORREF 0x00ffe8e8 (BGR)
+            DWMWA_TEXT_COLOR = 36
+            text = ctypes.c_uint32(0x00ffe8e8)
+            dwm.DwmSetWindowAttribute(
+                hwnd, DWMWA_TEXT_COLOR,
+                ctypes.byref(text), ctypes.sizeof(text),
+            )
+        except Exception:
+            pass  # non-Windows or unsupported OS version
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._apply_dwm_theme()  # reapply once the window is visible
 
     # ── UI construction ───────────────────────────────────────────────────────
 
