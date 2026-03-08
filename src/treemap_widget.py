@@ -1,20 +1,41 @@
-"""Custom QWidget that renders a treemap using QPainter."""
+"""Custom QWidget that renders a treemap using QPainter — Dark Matter style."""
 from __future__ import annotations
 import colorsys
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PyQt6.QtCore import QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFontMetrics, QPainter, QPen
+from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QRadialGradient,
+)
 from PyQt6.QtWidgets import QApplication, QMenu, QToolTip, QWidget
 
 from src.models import ColorScheme, FolderNode
 from src.treemap import Rect, layout
+from src.styles import (
+    BORDER,
+    CYAN,
+    TEXT,
+    TEXT_MID,
+    VOID,
+    load_fonts,
+)
+
+_GAP          = 3    # px inset between cells
+_RADI         = 6    # corner radius
+_TOOLBAR_INSET = 84  # px reserved at top for the floating toolbar (52h + 16 offset + 16 breathing)
 
 
 class TreemapWidget(QWidget):
-    node_clicked = pyqtSignal(object)   # FolderNode
+    node_clicked     = pyqtSignal(object)   # FolderNode
     resize_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -23,14 +44,21 @@ class TreemapWidget(QWidget):
         self._layout: dict[FolderNode, QRectF] = {}
         self._scheme = ColorScheme()
         self._owner_colors: dict[str, QColor] = {}
+        self._hovered_node: FolderNode | None = None
         self.setMouseTracking(True)
         self.setMinimumSize(400, 300)
+
+        families = load_fonts()
+        self._font_name  = QFont(families.get("outfit", "Segoe UI"), 12)
+        self._font_name.setWeight(QFont.Weight.Medium)
+        self._font_size  = QFont(families.get("jetbrains_mono", "Consolas"), 10)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def set_root(self, root: FolderNode, scheme: ColorScheme) -> None:
         self._root = root
         self._scheme = scheme
+        self._hovered_node = None
         self._rebuild_layout()
         self.update()
 
@@ -44,7 +72,8 @@ class TreemapWidget(QWidget):
         if self._root is None:
             self._layout = {}
             return
-        canvas = Rect(0, 0, self.width(), self.height())
+        # Leave a top strip clear so the floating toolbar never overlaps cell labels
+        canvas = Rect(0, _TOOLBAR_INSET, self.width(), self.height() - _TOOLBAR_INSET)
         raw = layout(self._root, canvas)
         self._layout = {
             node: QRectF(r.x, r.y, r.w, r.h)
@@ -55,48 +84,119 @@ class TreemapWidget(QWidget):
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.fillRect(self.rect(), QColor("#1e1e2e"))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Background: void black with subtle radial glow at center
+        painter.fillRect(self.rect(), QColor(VOID))
+        cx, cy = self.width() / 2, self.height() / 2
+        rad_grad = QRadialGradient(QPointF(cx, cy), max(cx, cy))
+        rad_grad.setColorAt(0, QColor(10, 10, 26, 120))
+        rad_grad.setColorAt(1, QColor(6, 6, 18, 0))
+        painter.fillRect(self.rect(), rad_grad)
 
         if not self._layout:
-            painter.setPen(QColor("#888"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No data")
+            self._draw_empty(painter)
+            painter.end()
             return
 
-        # Collect metadata for color scaling
+        # Metadata for color scaling
         all_nodes = list(self._layout.keys())
         min_mod, max_mod = self._date_range(all_nodes, 'modified')
         min_cre, max_cre = self._date_range(all_nodes, 'created')
         min_size = min(n.size for n in all_nodes)
         max_size = max(n.size for n in all_nodes)
 
-        pen = QPen(QColor("#111"), 1)
-        painter.setPen(pen)
-
         for node, rect in self._layout.items():
             if rect.width() < 2 or rect.height() < 2:
                 continue
 
-            visible = self._passes_filter(node)
-            color = self._node_color(node, min_size, max_size, min_mod, max_mod,
-                                     min_cre, max_cre)
-            if not visible:
-                color = color.darker(200)
+            # Apply _GAP inset
+            cell = rect.adjusted(_GAP, _GAP, -_GAP, -_GAP)
+            if cell.width() < 2 or cell.height() < 2:
+                continue
 
-            painter.fillRect(rect, color)
-            painter.drawRect(rect)
-            self._draw_label(painter, node, rect)
+            visible = self._passes_filter(node)
+            base_color = self._node_color(
+                node, min_size, max_size, min_mod, max_mod, min_cre, max_cre
+            )
+            if not visible:
+                base_color = base_color.darker(280)
+
+            is_hovered = node is self._hovered_node
+
+            self._draw_cell(painter, cell, base_color, is_hovered)
+            self._draw_label(painter, node, cell)
 
         painter.end()
 
-    def _draw_label(self, painter: QPainter, node: FolderNode, rect: QRectF) -> None:
-        if rect.width() < 40 or rect.height() < 16:
+    def _draw_empty(self, painter: QPainter) -> None:
+        families = load_fonts()
+        font = QFont(families.get("outfit", "Segoe UI"), 15)
+        painter.setFont(font)
+        painter.setPen(QColor(TEXT_MID))
+        painter.drawText(
+            self.rect(),
+            Qt.AlignmentFlag.AlignCenter,
+            "Open a folder to explore",
+        )
+
+    def _draw_cell(
+        self,
+        painter: QPainter,
+        cell: QRectF,
+        base: QColor,
+        hovered: bool,
+    ) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(cell, _RADI, _RADI)
+
+        # Vertical gradient: top 30% lighter (glass sheen)
+        grad = QLinearGradient(cell.topLeft(), cell.bottomLeft())
+        lighter = base.lighter(145)
+        grad.setColorAt(0.0, lighter)
+        grad.setColorAt(0.3, base)
+        grad.setColorAt(1.0, base.darker(115))
+
+        painter.fillPath(path, grad)
+
+        # Border
+        if hovered:
+            pen = QPen(QColor(CYAN), 2.0)
+        else:
+            pen = QPen(QColor(BORDER), 1.0)
+        painter.setPen(pen)
+        painter.drawPath(path)
+
+        # Hover glow: extra translucent cyan highlight at top
+        if hovered:
+            glow_rect = QRectF(cell.x(), cell.y(), cell.width(), cell.height() * 0.25)
+            glow_path = QPainterPath()
+            glow_path.addRoundedRect(glow_rect, _RADI, _RADI)
+            painter.fillPath(glow_path, QColor(0, 212, 255, 35))
+
+    def _draw_label(self, painter: QPainter, node: FolderNode, cell: QRectF) -> None:
+        if cell.width() < 80 or cell.height() < 40:
             return
+
         name = node.path.name or str(node.path)
-        fm = QFontMetrics(painter.font())
-        text = fm.elidedText(name, Qt.TextElideMode.ElideRight, int(rect.width()) - 6)
-        painter.setPen(QColor("#fff"))
-        painter.drawText(rect.adjusted(3, 3, -3, -3), Qt.AlignmentFlag.AlignTop, text)
+        inner = cell.adjusted(5, 5, -5, -5)
+
+        # Line 1: folder name (Outfit Medium 10pt)
+        painter.setFont(self._font_name)
+        fm1 = QFontMetrics(self._font_name)
+        elided_name = fm1.elidedText(name, Qt.TextElideMode.ElideRight, int(inner.width()))
+        painter.setPen(QColor(TEXT))
+        name_rect = QRectF(inner.x(), inner.y(), inner.width(), fm1.height())
+        painter.drawText(name_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided_name)
+
+        # Line 2: size (JetBrains Mono 8pt)
+        if cell.height() >= 56:
+            painter.setFont(self._font_size)
+            fm2 = QFontMetrics(self._font_size)
+            size_str = _fmt_size(node.size)
+            size_rect = QRectF(inner.x(), inner.y() + fm1.height() + 2, inner.width(), fm2.height())
+            painter.setPen(QColor(TEXT_MID))
+            painter.drawText(size_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, size_str)
 
     # ── Color logic ───────────────────────────────────────────────────────────
 
@@ -108,7 +208,7 @@ class TreemapWidget(QWidget):
 
         if mode == 'size':
             t = _norm(node.size, min_size, max_size)
-            return _blue_gradient(t)
+            return _size_gradient(t)
 
         if mode in ('modified', 'created'):
             ts = self._timestamp(node, mode)
@@ -127,7 +227,7 @@ class TreemapWidget(QWidget):
         if owner not in self._owner_colors:
             idx = len(self._owner_colors)
             hue = (idx * 0.137) % 1.0
-            r, g, b = colorsys.hsv_to_rgb(hue, 0.6, 0.75)
+            r, g, b = colorsys.hsv_to_rgb(hue, 0.72, 0.82)
             self._owner_colors[owner] = QColor(int(r * 255), int(g * 255), int(b * 255))
         return self._owner_colors[owner]
 
@@ -170,6 +270,9 @@ class TreemapWidget(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         node = self._node_at(event.position())
+        if node is not self._hovered_node:
+            self._hovered_node = node
+            self.update()
         if node:
             QToolTip.showText(event.globalPosition().toPoint(),
                               self._tooltip(node), self)
@@ -196,11 +299,18 @@ class TreemapWidget(QWidget):
         self.resize_requested.emit()
         super().resizeEvent(event)
 
+    def leaveEvent(self, event) -> None:
+        if self._hovered_node is not None:
+            self._hovered_node = None
+            self.update()
+        super().leaveEvent(event)
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _node_at(self, pos) -> FolderNode | None:
         for node, rect in self._layout.items():
-            if rect.contains(pos.x(), pos.y()):
+            cell = rect.adjusted(_GAP, _GAP, -_GAP, -_GAP)
+            if cell.contains(pos.x(), pos.y()):
                 return node
         return None
 
@@ -214,26 +324,39 @@ class TreemapWidget(QWidget):
 
 # ── Color helpers ─────────────────────────────────────────────────────────────
 
+import math as _math
+
+
 def _norm(value: float, lo: float, hi: float) -> float:
+    """Sqrt-scaled normalisation — spreads mid-range values more visibly."""
     if hi == lo:
         return 0.5
-    return max(0.0, min(1.0, (value - lo) / (hi - lo)))
+    linear = max(0.0, min(1.0, (value - lo) / (hi - lo)))
+    return _math.sqrt(linear)
 
 
-def _blue_gradient(t: float) -> QColor:
-    """Light blue (small) → dark blue (large)."""
-    r = int(30 + (1 - t) * 100)
-    g = int(80 + (1 - t) * 80)
-    b = int(180 + (1 - t) * 60)
-    return QColor(r, g, b)
+def _lerp_color(a: tuple, b: tuple, t: float) -> QColor:
+    return QColor(
+        int(a[0] + t * (b[0] - a[0])),
+        int(a[1] + t * (b[1] - a[1])),
+        int(a[2] + t * (b[2] - a[2])),
+    )
+
+
+def _size_gradient(t: float) -> QColor:
+    """3-stop: deep navy → ocean blue → electric cyan."""
+    if t < 0.5:
+        return _lerp_color((5, 5, 40), (10, 80, 180), t * 2)
+    else:
+        return _lerp_color((10, 80, 180), (0, 212, 255), (t - 0.5) * 2)
 
 
 def _date_gradient(t: float) -> QColor:
-    """Green (recent, t=1) → red (old, t=0)."""
-    r = int((1 - t) * 200 + 20)
-    g = int(t * 180 + 20)
-    b = 40
-    return QColor(r, g, b)
+    """3-stop: deep crimson → amber → emerald."""
+    if t < 0.5:
+        return _lerp_color((26, 0, 8), (180, 100, 0), t * 2)
+    else:
+        return _lerp_color((180, 100, 0), (0, 230, 118), (t - 0.5) * 2)
 
 
 def _fmt_size(size: int) -> str:

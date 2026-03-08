@@ -24,20 +24,30 @@ def _scan_dir(path: Path) -> FolderNode:
 
     try:
         entries = list(os.scandir(path))
-    except PermissionError:
-        logger.warning("Permission denied: %s", path)
+    except OSError as exc:
+        logger.warning("Cannot scan %s: %s", path, exc)
         return FolderNode(path=path, size=0, children=[])
 
     for entry in entries:
-        if entry.is_symlink():
+        try:
+            is_link = entry.is_symlink()
+        except OSError:
+            continue
+        if is_link:
             continue
 
         entry_path = Path(entry.path)
-        if entry.is_dir(follow_symlinks=False):
+        try:
+            is_dir  = entry.is_dir(follow_symlinks=False)
+            is_file = entry.is_file(follow_symlinks=False)
+        except OSError:
+            continue
+
+        if is_dir:
             child = _scan_dir(entry_path)
             children.append(child)
             total_size += child.size
-        elif entry.is_file(follow_symlinks=False):
+        elif is_file:
             try:
                 size = entry.stat().st_size
             except OSError:
@@ -73,20 +83,30 @@ class ScanWorker(QThread):
 
         try:
             entries = list(os.scandir(path))
-        except PermissionError:
-            logger.warning("Permission denied: %s", path)
+        except OSError as exc:
+            logger.warning("Cannot scan %s: %s", path, exc)
             return FolderNode(path=path, size=0, children=[])
 
         for entry in entries:
-            if entry.is_symlink():
+            try:
+                is_link = entry.is_symlink()
+            except OSError:
+                continue
+            if is_link:
                 continue
 
             entry_path = Path(entry.path)
-            if entry.is_dir(follow_symlinks=False):
+            try:
+                is_dir  = entry.is_dir(follow_symlinks=False)
+                is_file = entry.is_file(follow_symlinks=False)
+            except OSError:
+                continue
+
+            if is_dir:
                 child = self._scan_dir(entry_path)
                 children.append(child)
                 total_size += child.size
-            elif entry.is_file(follow_symlinks=False):
+            elif is_file:
                 try:
                     size = entry.stat().st_size
                 except OSError:
